@@ -9,10 +9,8 @@
 #include <unistd.h>
 
 
-
 AVFormatContext* open_device()
 {
-
     char error[1024] = {0};
     //1、注册音频设备
     avdevice_register_all();
@@ -44,7 +42,6 @@ AVFormatContext* open_device()
 }
 
 
-
 SwrContext* create_swr_context()
 {
     char error[1024] = {0};
@@ -56,12 +53,13 @@ SwrContext* create_swr_context()
     AVChannelLayout in_ch_layout = AV_CHANNEL_LAYOUT_MONO;
     AVChannelLayout out_ch_layout = AV_CHANNEL_LAYOUT_STEREO;
     //设置源音频参数
-    int  ret = swr_alloc_set_opts2(&swr_context,
-                                      &out_ch_layout, AV_SAMPLE_FMT_S16, 44100,
-                                      &in_ch_layout, AV_SAMPLE_FMT_FLT, 44100,
-                                      0, NULL);
+    int ret = swr_alloc_set_opts2(&swr_context,
+                                  &out_ch_layout, AV_SAMPLE_FMT_S16, 44100,
+                                  &in_ch_layout, AV_SAMPLE_FMT_FLT, 44100,
+                                  0, NULL);
 
-    if (ret < 0) {
+    if (ret < 0)
+    {
         av_strerror(ret, error, 1024);
         printf("error: %s\n", error);
         return NULL;
@@ -72,13 +70,130 @@ SwrContext* create_swr_context()
 }
 
 
+/* check that a given sample format is supported by the encoder */
+static int check_sample_fmt(const AVCodec* codec, enum AVSampleFormat sample_fmt)
+{
+    const enum AVSampleFormat* p = codec->sample_fmts;
+
+    while (*p != AV_SAMPLE_FMT_NONE)
+    {
+        if (*p == sample_fmt)
+            return 1;
+        p++;
+    }
+    return 0;
+}
+
+
+/* just pick the highest supported samplerate */
+int select_sample_rate(const AVCodec* codec)
+{
+    const int* p;
+    int best_samplerate = 0;
+
+    if (!codec->supported_samplerates)
+        return 44100;
+
+    p = codec->supported_samplerates;
+    while (*p)
+    {
+        if (!best_samplerate || abs(44100 - *p) < abs(44100 - best_samplerate))
+            best_samplerate = *p;
+        p++;
+    }
+    return best_samplerate;
+}
+
+/* select layout with the highest channel count */
+int select_channel_layout(const AVCodec* codec, AVChannelLayout* dst)
+{
+    const AVChannelLayout *p, *best_ch_layout;
+    int best_nb_channels = 0;
+
+    if (!codec->ch_layouts)
+    {
+        AVChannelLayout src = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
+        return av_channel_layout_copy(dst, &src);
+    }
+
+
+    p = codec->ch_layouts;
+    while (p->nb_channels)
+    {
+        int nb_channels = p->nb_channels;
+
+        if (nb_channels > best_nb_channels)
+        {
+            best_ch_layout = p;
+            best_nb_channels = nb_channels;
+        }
+        p++;
+    }
+    return av_channel_layout_copy(dst, best_ch_layout);
+}
+
+void encode(AVCodecContext* ctx, AVFrame* frame, AVPacket* pkt,
+            FILE* output)
+{
+    int ret;
+
+    /* send the frame for encoding */
+    ret = avcodec_send_frame(ctx, frame);
+    if (ret < 0)
+    {
+        fprintf(stderr, "Error sending the frame to the encoder\n");
+        exit(1);
+    }
+
+    /* read all the available output packets (in general there may be any
+     * number of them */
+    while (ret >= 0)
+    {
+        ret = avcodec_receive_packet(ctx, pkt);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+            return;
+        else if (ret < 0)
+        {
+            fprintf(stderr, "Error encoding audio frame\n");
+            exit(1);
+        }
+
+        fwrite(pkt->data, pkt->size, 1, output);
+        av_packet_unref(pkt);
+    }
+}
+
+
+AVCodecContext* create_encoder_context()
+{
+    // 创建编码器上下文
+    const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_AAC);
+    AVCodecContext* codec_context = avcodec_alloc_context3(codec);
+    // 设置编码参数
+    // aac 需要设置的编码格式是 AV_SAMPLE_FMT_FLTP
+    codec_context->sample_fmt = AV_SAMPLE_FMT_FLTP;
+    codec_context->sample_rate = 44100;
+    codec_context->frame_size = 512;
+    // select_channel_layout(codec, &codec_context->ch_layout);
+    codec_context->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
+
+    // 我的理解是，设置了采样率，采样大小，声道数，那么比特率应该就是确定的，为什么还需要设置
+    codec_context->bit_rate = 64000; ////AAC_LC: 128K（默认）, AAC HE: 64K, AAC HE V2: 32K
+    // codec_context->profile = FF_PROFILE_AAC_LOW; // 此参数生效，一定不能设置bit_rate
+    // codec_context->codec_type = AVMEDIA_TYPE_AUDIO;
+    // 打开编码器
+    avcodec_open2(codec_context, codec, NULL);
+    return codec_context;
+}
+
+
 /**
  *
  * 重采样后的播放命令  ffplay -ar 44100  -f s16le audio.pcm
  *
  * 通过查看 ffplay -formats 可以查看支持的音频采样率格式 https://www.ffmpeg.org/ffplay.html#toc-Description
  * https://www.reddit.com/r/ffmpeg/comments/1edfvsx/whats_the_replacement_for_the_ac_option/
- * @return 
+ * @return
  */
 int main(void)
 {
@@ -91,10 +206,12 @@ int main(void)
     AVFormatContext* format_context = open_device();
 
     const char* file_path = "/Users/xuan/CLionProjects/ffmpeg/audio.pcm";
+    // const char* file_path = "/Users/xuan/CLionProjects/ffmpeg/audio.aac";
     FILE* out_file = fopen(file_path, "wb+");
     int count = 0;
     // 音视频数据都是封装在AVPacket中，所以可以在上下文中获得AVPacket，让程序周期性的拉取音频设备的音频数据，并读取
     AVPacket packet;
+
 
     // ************* 重采样 配置 start *************
     // 创建并初始化 重采样上下文
@@ -117,6 +234,33 @@ int main(void)
     //4、分配输出音频数据缓冲区
     av_samples_alloc(&out_buffer, &out_buffer_size, 2, 512, AV_SAMPLE_FMT_S16, 0);
     //*****重采样 配置 end********
+
+
+    // *************使用编码器编码 start ************
+    // 音频输入数据
+
+    AVCodecContext* av_codec_context = create_encoder_context();
+
+    AVPacket* newPkt = av_packet_alloc();
+
+    AVFrame* frame = av_frame_alloc();
+    if (!frame)
+    {
+        fprintf(stderr, "Could not allocate audio frame\n");
+        exit(1);
+    }
+    // 设置单通道数据采样大小
+    frame->nb_samples = av_codec_context->frame_size;
+    // 数据采样的大小
+    frame->format = av_codec_context->sample_fmt;
+    // 设置对用的通道大小
+    ret = av_channel_layout_copy(&frame->ch_layout, &av_codec_context->ch_layout);
+    if (ret < 0)
+        exit(1);
+
+    // 设置AVFrame的buffer
+    av_frame_get_buffer(frame, 0);
+    // *************使用编码器编码 end ************
 
 
     while (count++ < 1000)
@@ -149,11 +293,25 @@ int main(void)
         //重采样音频数据
         swr_convert(swr_context, &out_buffer, 512, &in_buffer, 512);
 
+        // *************使用编码器编码 start ************
+
+        // memcpy(frame->data[0], out_buffer, out_buffer_size);
+
+        // encode(av_codec_context, frame, newPkt, out_file);
 
         fwrite(out_buffer, out_buffer_size, 1, out_file);
         fflush(out_file);
+        // *************使用编码器编码 end ************
+
         av_packet_unref(&packet);
     }
+
+
+    // encode(av_codec_context, NULL, newPkt, out_file);
+    av_frame_free(&frame);
+    av_packet_free(&newPkt);
+
+
     fclose(out_file);
     //7、释放重采样上下文，释放输入输出音频数据缓冲区
     av_free(in_buffer);
@@ -164,8 +322,3 @@ int main(void)
     av_log(NULL, AV_LOG_INFO, "finish read audio device.");
     return 0;
 }
-
-
-
-
-
