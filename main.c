@@ -8,21 +8,12 @@
 #include  "libswresample/swresample.h"
 #include <unistd.h>
 
-/**
- *
- * 重采样后的播放命令  ffplay -ar 44100  -f s16le audio.pcm
- *
- * 通过查看 ffplay -formats 可以查看支持的音频采样率格式 https://www.ffmpeg.org/ffplay.html#toc-Description
- * @return 
- */
-int main(void)
+
+
+AVFormatContext* open_device()
 {
-    av_log_set_level(AV_LOG_DEBUG);
-    //ffmpeg 打印日志
-    av_log(NULL, AV_LOG_DEBUG, "Hello, World ffmpeg!\n");
 
     char error[1024] = {0};
-    int ret = 0;
     //1、注册音频设备
     avdevice_register_all();
 
@@ -38,7 +29,7 @@ int main(void)
     // 设置双通道，todo 不起作用
     // av_dict_set(&options, "channels", "2", 0);
     //3、打开音频设备
-    ret = avformat_open_input(&format_context, input_device, input_format, &options);
+    int ret = avformat_open_input(&format_context, input_device, input_format, &options);
     // 打印音频流信息
     av_dump_format(format_context, 0, input_device, 0);
     if (ret < 0)
@@ -46,26 +37,26 @@ int main(void)
         av_strerror(ret, error, 1024);
         //打印error
         printf("error: %s\n", error);
-        return -1;
+        return NULL;
     }
 
-    // 音视频数据都是封装在AVPacket中，所以可以在上下文中获得AVPacket，让程序周期性的拉取音频设备的音频数据，并读取
-    AVPacket packet;
-    int count = 0;
-    const char* file_path = "/Users/xuan/CLionProjects/ffmpeg/audio.pcm";
-    FILE* out_file = fopen(file_path, "wb+");
+    return format_context;
+}
 
 
-    //创建重采样音频数据
+
+SwrContext* create_swr_context()
+{
+    char error[1024] = {0};
+
     //1、创建重采样上下文
     SwrContext* swr_context = swr_alloc();
-    //4、设置重采样参数
 
+    //2、设置重采样参数
     AVChannelLayout in_ch_layout = AV_CHANNEL_LAYOUT_MONO;
-
     AVChannelLayout out_ch_layout = AV_CHANNEL_LAYOUT_STEREO;
     //设置源音频参数
-    ret = swr_alloc_set_opts2(&swr_context,
+    int  ret = swr_alloc_set_opts2(&swr_context,
                                       &out_ch_layout, AV_SAMPLE_FMT_S16, 44100,
                                       &in_ch_layout, AV_SAMPLE_FMT_FLT, 44100,
                                       0, NULL);
@@ -73,12 +64,41 @@ int main(void)
     if (ret < 0) {
         av_strerror(ret, error, 1024);
         printf("error: %s\n", error);
-        return -1;
+        return NULL;
     }
     //5、初始化重采样上下文
     swr_init(swr_context);
-    //6、重采样音频数据 开始
+    return swr_context;
+}
 
+
+/**
+ *
+ * 重采样后的播放命令  ffplay -ar 44100  -f s16le audio.pcm
+ *
+ * 通过查看 ffplay -formats 可以查看支持的音频采样率格式 https://www.ffmpeg.org/ffplay.html#toc-Description
+ * https://www.reddit.com/r/ffmpeg/comments/1edfvsx/whats_the_replacement_for_the_ac_option/
+ * @return 
+ */
+int main(void)
+{
+    av_log_set_level(AV_LOG_DEBUG);
+    //ffmpeg 打印日志
+    av_log(NULL, AV_LOG_DEBUG, "Hello, World ffmpeg!\n");
+
+    int ret = 0;
+    //调用open_device
+    AVFormatContext* format_context = open_device();
+
+    const char* file_path = "/Users/xuan/CLionProjects/ffmpeg/audio.pcm";
+    FILE* out_file = fopen(file_path, "wb+");
+    int count = 0;
+    // 音视频数据都是封装在AVPacket中，所以可以在上下文中获得AVPacket，让程序周期性的拉取音频设备的音频数据，并读取
+    AVPacket packet;
+
+    // ************* 重采样 配置 start *************
+    // 创建并初始化 重采样上下文
+    SwrContext* swr_context = create_swr_context();
 
     //1、创建输入音频数据缓冲区
     uint8_t* in_buffer;
@@ -96,9 +116,7 @@ int main(void)
     int out_buffer_size = 0;
     //4、分配输出音频数据缓冲区
     av_samples_alloc(&out_buffer, &out_buffer_size, 2, 512, AV_SAMPLE_FMT_S16, 0);
-    //5、重采样音频数据
-    //6、重采样音频数据 结束
-
+    //*****重采样 配置 end********
 
 
     while (count++ < 1000)
@@ -146,5 +164,8 @@ int main(void)
     av_log(NULL, AV_LOG_INFO, "finish read audio device.");
     return 0;
 }
+
+
+
 
 
