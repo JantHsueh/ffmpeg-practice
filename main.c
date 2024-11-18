@@ -31,6 +31,8 @@ AVFormatContext* open_device()
     // av_dict_set(&options, "b", "64000", 0);
     av_dict_set(&options, "video_size", "640x480", 0);
     av_dict_set(&options, "framerate", "30", 0);
+    //设置视频格式为NV12
+    av_dict_set(&options, "pixel_format", "nv12", 0);
     //3、打开音频设备
     int ret = avformat_open_input(&format_context, input_device, input_format, &options);
     // 打印音频流信息
@@ -549,7 +551,7 @@ void recoder_video()
 
     // 创建编码后的输出packet
     AVPacket* pkt = av_packet_alloc();
-
+    int i = 0;
     while (count++ < 1000)
     {
         ret = av_read_frame(format_context, pkt);
@@ -578,8 +580,23 @@ void recoder_video()
             // 如果pkt->size不对，会导致视频画面滚动
             // 程序自动设置了，视频格式为 uyvy422, 640x480x2 = 614400
             // 虽然ret == -35，睡眠了0.5s，但每次返回的是一个视频帧
-            fwrite(pkt->data, pkt->size, 1, out_file);
-            fflush(out_file);
+            // fwrite(pkt->data, pkt->size, 1, out_file);
+            // fflush(out_file);
+
+
+            //把NV12 数据转为YUV420
+            memcpy(av_frame->data[0], pkt->data, 307200);
+
+            for (i = 0; i < 307200 / 4; i++)
+            {
+                av_frame->data[1][i] = pkt->data[307200 + i * 2];
+                av_frame->data[2][i] = pkt->data[307200 + i * 2 + 1];
+            }
+            fwrite(av_frame->data[0], 307200, 1, out_file);
+            fwrite(av_frame->data[1], 307200 / 4, 1, out_file);
+            fwrite(av_frame->data[2], 307200 / 4, 1, out_file);
+            // fflush(out_file);
+
 
             av_packet_unref(pkt);
         }
