@@ -22,12 +22,15 @@ AVFormatContext* open_device()
     AVFormatContext* format_context = NULL;
     // 可以是一个url，或者设备对应格式
     // mac 设备名称格式，[[video device]:[audio device]]
-    char* input_device = ":0";
+    // video device 0 表示摄像头，1 表示桌面
+    char* input_device = "0";
     AVDictionary* options = NULL;
     // 设置双通道，todo 不起作用
     // av_dict_set(&options, "channels", "2", 0);
     // 设置比特率为64000
-    av_dict_set(&options, "b", "64000", 0);
+    // av_dict_set(&options, "b", "64000", 0);
+    av_dict_set(&options, "video_size", "640x480", 0);
+    av_dict_set(&options, "framerate", "30", 0);
     //3、打开音频设备
     int ret = avformat_open_input(&format_context, input_device, input_format, &options);
     // 打印音频流信息
@@ -177,7 +180,8 @@ AVCodecContext* create_encoder_context()
     codec_context->sample_fmt = AV_SAMPLE_FMT_S16;
     // codec_context->bit_rate = 64000; ////AAC_LC: 128K（默认）, AAC HE: 64K, AAC HE V2: 32K
 
-    if (!check_sample_fmt(codec, codec_context->sample_fmt)) {
+    if (!check_sample_fmt(codec, codec_context->sample_fmt))
+    {
         fprintf(stderr, "Encoder does not support sample format %s",
                 av_get_sample_fmt_name(codec_context->sample_fmt));
         exit(1);
@@ -206,8 +210,8 @@ AVCodecContext* create_encoder_context()
 
 
 AVFrame* alloc_audio_frame(enum AVSampleFormat sample_fmt,
-                                 AVChannelLayout ch_layout, int sample_rate,
-                                 int nb_samples)
+                           AVChannelLayout ch_layout, int sample_rate,
+                           int nb_samples)
 {
     AVFrame* frame = av_frame_alloc();
     int ret;
@@ -237,19 +241,93 @@ AVFrame* alloc_audio_frame(enum AVSampleFormat sample_fmt,
     return frame;
 }
 
+
 /**
  *
- * 重采样后的播放命令
- * 播放pcm音频，必须设置采样率、采样大小、通道数(默认单声道)
- * ffplay -ar 44100  -f f32le audio.pcm
- * ffplay -ar 44100 -ch_layout stereo -f s16le audio.pcm
- * https://fftrac-bg.ffmpeg.org/ticket/11077
- *
- * 通过查看 ffplay -formats 可以查看支持的音频采样率格式 https://www.ffmpeg.org/ffplay.html#toc-Description
- * https://www.reddit.com/r/ffmpeg/comments/1edfvsx/whats_the_replacement_for_the_ac_option/
- * @return
+ * 打开视频编码器
  */
-int main(void)
+void open_video_encoder(int width, int height, AVCodecContext** codec_context)
+{
+    //1、查找编码器
+    const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+    if (!codec)
+    {
+        fprintf(stderr, "Codec not found\n");
+        exit(1);
+    }
+
+    //2、创建编码器上下文
+    *codec_context = avcodec_alloc_context3(codec);
+    if (!(*codec_context))
+    {
+        fprintf(stderr, "Could not allocate video codec context\n");
+        exit(1);
+    }
+
+    //3、设置编码器参数
+
+    //sps
+    //
+    // (*codec_context)->profile = FF_PROFILE_H264_HIGH_444;
+    // (*codec_context)->level = 50;
+
+    (*codec_context)->width = width;
+    (*codec_context)->height = height;
+
+    (*codec_context)->gop_size = 250; // 两个I帧之间的帧数量
+    (*codec_context)->keyint_min = 250; // option 两个I帧之间的最小帧数, 如果两个帧之间差别大，可以插入一个关键帧
+
+    // 设置B帧，减少码流
+    (*codec_context)->max_b_frames = 3; // option  最大B帧数
+    (*codec_context)->has_b_frames = 1; // option  1 表示有B帧，0表示没有B帧，更低的延时
+    (*codec_context)->refs = 3; // option
+
+    (*codec_context)->pix_fmt = AV_PIX_FMT_YUV420P;
+
+    (*codec_context)->bit_rate = 600000;
+
+    // 设置帧率
+    (*codec_context)->time_base = (AVRational){1, 25};
+    (*codec_context)->framerate = (AVRational){25, 1};
+
+    //4、打开编码器
+    if (avcodec_open2(*codec_context, codec, NULL) < 0)
+    {
+        fprintf(stderr, "Could not open codec\n");
+        exit(1);
+    }
+}
+
+
+/**
+ * 创建视频帧
+ */
+AVFrame* create_video_frame(int width, int height)
+{
+    AVFrame* frame = av_frame_alloc();
+    if (!frame)
+    {
+        fprintf(stderr, "Could not allocate video frame\n");
+        exit(1);
+    }
+
+    frame->format = AV_PIX_FMT_YUV420P;
+    frame->width = width;
+    frame->height = height;
+
+    // 分配内存
+    int ret = av_frame_get_buffer(frame, 32); // 按照32位对其
+    if (ret < 0)
+    {
+        fprintf(stderr, "Could not allocate the video frame data\n");
+        exit(1);
+    }
+
+    return frame;
+}
+
+
+int recoder_audio()
 {
     av_log_set_level(AV_LOG_DEBUG);
     //ffmpeg 打印日志
@@ -258,6 +336,7 @@ int main(void)
     int ret = 0;
     //调用open_device
     AVFormatContext* format_context = open_device();
+    AVCodecContext* video_codec_context = NULL;
 
 
     int audio_stream_index = -1; // microphone input audio stream index
@@ -356,7 +435,6 @@ int main(void)
 
     while (count++ < 1000)
     {
-
         ret = av_read_frame(format_context, pkt);
 
         // ret返回-35 表示设备还没准备好, 先睡眠1s
@@ -421,14 +499,9 @@ int main(void)
                     // *************使用编码器编码 end ************
 
                     av_packet_unref(pkt);
-
                 }
             }
         }
-
-
-
-
     }
 
 
@@ -445,5 +518,89 @@ int main(void)
     //4、关闭音频设备
     avformat_close_input(&format_context);
     av_log(NULL, AV_LOG_INFO, "finish read audio device.");
+}
+
+/**
+ * 录制视频
+ * 播放命令 ffplay -pixel_format uyvy422 -video_size 640x480 v.yuv
+ * 如果不设置-pixel_format uyvy422，视频会花屏
+ */
+void recoder_video()
+{
+    int ret = 0;
+    int count = 0;
+    int success_count = 0;
+
+    //调用open_device
+    AVFormatContext* format_context = open_device();
+    AVCodecContext* video_codec_context = NULL;
+
+    open_video_encoder(640, 480, &video_codec_context);
+
+    const char* file_path = "/Users/xuan/CLionProjects/ffmpeg/v.yuv";
+    // const char* file_path = "/Users/xuan/CLionProjects/ffmpeg/audio.aac";
+    // 判断文件是否存在，如果存在，就删除
+    remove(file_path);
+
+    FILE* out_file = fopen(file_path, "wb+");
+
+    //
+    AVFrame* av_frame = create_video_frame(640, 480);
+
+    // 创建编码后的输出packet
+    AVPacket* pkt = av_packet_alloc();
+
+    while (count++ < 1000)
+    {
+        ret = av_read_frame(format_context, pkt);
+
+        // ret返回-35 表示设备还没准备好, 先睡眠1s
+        // device not ready, sleep 1s
+        if (ret == -35)
+        {
+            av_log(NULL, AV_LOG_WARNING, "device not ready, wait 0.5s\n");
+            av_packet_unref(pkt);
+            usleep(5000);
+            continue;
+        }
+        if (ret < 0)
+        {
+            av_log(NULL, AV_LOG_ERROR, "read data error from device\n");
+            av_packet_unref(pkt);
+            break;
+        }
+
+        if (ret == 0)
+        {
+            av_log(NULL, AV_LOG_INFO,
+                   "pkt size is %d(%p),count=%d, success_count=%d\n",
+                   pkt->size, pkt->data, count, success_count++);
+            // 如果pkt->size不对，会导致视频画面滚动
+            // 程序自动设置了，视频格式为 uyvy422, 640x480x2 = 614400
+            // 虽然ret == -35，睡眠了0.5s，但每次返回的是一个视频帧
+            fwrite(pkt->data, pkt->size, 1, out_file);
+            fflush(out_file);
+
+            av_packet_unref(pkt);
+        }
+    }
+}
+
+
+/**
+ *
+ * 重采样后的播放命令
+ * 播放pcm音频，必须设置采样率、采样大小、通道数(默认单声道)
+ * ffplay -ar 44100  -f f32le audio.pcm
+ * ffplay -ar 44100 -ch_layout stereo -f s16le audio.pcm
+ * https://fftrac-bg.ffmpeg.org/ticket/11077
+ *
+ * 通过查看 ffplay -formats 可以查看支持的音频采样率格式 https://www.ffmpeg.org/ffplay.html#toc-Description
+ * https://www.reddit.com/r/ffmpeg/comments/1edfvsx/whats_the_replacement_for_the_ac_option/
+ * @return
+ */
+int main(void)
+{
+    recoder_video();
     return 0;
 }
