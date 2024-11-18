@@ -26,6 +26,8 @@ AVFormatContext* open_device()
     AVDictionary* options = NULL;
     // 设置双通道，todo 不起作用
     // av_dict_set(&options, "channels", "2", 0);
+    // 设置比特率为64000
+    av_dict_set(&options, "b", "64000", 0);
     //3、打开音频设备
     int ret = avformat_open_input(&format_context, input_device, input_format, &options);
     // 打印音频流信息
@@ -54,8 +56,8 @@ SwrContext* create_swr_context()
     AVChannelLayout out_ch_layout = AV_CHANNEL_LAYOUT_STEREO;
     //设置源音频参数
     int ret = swr_alloc_set_opts2(&swr_context,
-                                  &out_ch_layout, AV_SAMPLE_FMT_S16, 44100,
-                                  &in_ch_layout, AV_SAMPLE_FMT_FLT, 44100,
+                                  &out_ch_layout, AV_SAMPLE_FMT_S16, 48000,
+                                  &in_ch_layout, AV_SAMPLE_FMT_FLT, 48000,
                                   0, NULL);
 
     if (ret < 0)
@@ -158,7 +160,7 @@ void encode(AVCodecContext* ctx, AVFrame* frame, AVPacket* pkt,
             exit(1);
         }
 
-        fwrite(pkt->data, pkt->size, 1, output);
+        fwrite(pkt->data, 1, pkt->size, output);
         av_packet_unref(pkt);
     }
 }
@@ -167,18 +169,34 @@ void encode(AVCodecContext* ctx, AVFrame* frame, AVPacket* pkt,
 AVCodecContext* create_encoder_context()
 {
     // 创建编码器上下文
-    const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_AAC);
+    const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_MP2);
+    // const AVCodec* codec = avcodec_find_encoder_by_name("libfdk_aac");
     AVCodecContext* codec_context = avcodec_alloc_context3(codec);
     // 设置编码参数
+
+    codec_context->sample_fmt = AV_SAMPLE_FMT_S16;
+    // codec_context->bit_rate = 64000; ////AAC_LC: 128K（默认）, AAC HE: 64K, AAC HE V2: 32K
+
+    if (!check_sample_fmt(codec, codec_context->sample_fmt)) {
+        fprintf(stderr, "Encoder does not support sample format %s",
+                av_get_sample_fmt_name(codec_context->sample_fmt));
+        exit(1);
+    }
+
+    // select_channel_layout(codec, &codec_context->ch_layout);
+
+
     // aac 需要设置的编码格式是 AV_SAMPLE_FMT_FLTP
-    codec_context->sample_fmt = AV_SAMPLE_FMT_FLTP;
-    codec_context->sample_rate = 44100;
-    codec_context->frame_size = 512;
+    /* select other audio parameters supported by the encoder */
+    // codec_context->sample_rate = select_sample_rate(codec);
+    codec_context->sample_rate = 48000;
+    //不起作用
+    // codec_context->frame_size = 1152;
     // select_channel_layout(codec, &codec_context->ch_layout);
     codec_context->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
 
     // 我的理解是，设置了采样率，采样大小，声道数，那么比特率应该就是确定的，为什么还需要设置
-    codec_context->bit_rate = 64000; ////AAC_LC: 128K（默认）, AAC HE: 64K, AAC HE V2: 32K
+    // codec_context->bit_rate = 64000; ////AAC_LC: 128K（默认）, AAC HE: 64K, AAC HE V2: 32K
     // codec_context->profile = FF_PROFILE_AAC_LOW; // 此参数生效，一定不能设置bit_rate
     // codec_context->codec_type = AVMEDIA_TYPE_AUDIO;
     // 打开编码器
@@ -187,9 +205,45 @@ AVCodecContext* create_encoder_context()
 }
 
 
+AVFrame* alloc_audio_frame(enum AVSampleFormat sample_fmt,
+                                 AVChannelLayout ch_layout, int sample_rate,
+                                 int nb_samples)
+{
+    AVFrame* frame = av_frame_alloc();
+    int ret;
+
+    if (!frame)
+    {
+        fprintf(stderr, "Error allocating an audio frame\n");
+        exit(1);
+    }
+    // 多次测试发现，带编码的帧，需要设置好这些参数，之前没有设置sample_rate，导致保存的音频总是有问题，滋滋响
+    frame->format = sample_fmt;
+    frame->ch_layout = ch_layout;
+    frame->sample_rate = sample_rate;
+    frame->nb_samples = nb_samples;
+
+    if (nb_samples)
+    {
+        ret = av_frame_get_buffer(frame, 0);
+
+        if (ret < 0)
+        {
+            fprintf(stderr, "Error allocating an audio buffer\n");
+            exit(1);
+        }
+    }
+
+    return frame;
+}
+
 /**
  *
- * 重采样后的播放命令  ffplay -ar 44100  -f s16le audio.pcm
+ * 重采样后的播放命令
+ * 播放pcm音频，必须设置采样率、采样大小、通道数(默认单声道)
+ * ffplay -ar 44100  -f f32le audio.pcm
+ * ffplay -ar 44100 -ch_layout stereo -f s16le audio.pcm
+ * https://fftrac-bg.ffmpeg.org/ticket/11077
  *
  * 通过查看 ffplay -formats 可以查看支持的音频采样率格式 https://www.ffmpeg.org/ffplay.html#toc-Description
  * https://www.reddit.com/r/ffmpeg/comments/1edfvsx/whats_the_replacement_for_the_ac_option/
@@ -205,12 +259,66 @@ int main(void)
     //调用open_device
     AVFormatContext* format_context = open_device();
 
+
+    int audio_stream_index = -1; // microphone input audio stream index
+    AVCodec* audio_decoder = NULL;
+    AVCodecContext* audio_dec_ctx = NULL;
+    // 寻找音频流
+    for (int i = 0; i < format_context->nb_streams; i++)
+    {
+        if (format_context->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+        {
+            audio_stream_index = i;
+            break;
+        }
+    }
+
+    if (audio_stream_index == -1)
+    {
+        fprintf(stderr, "%s could not find an audio stream.\n", __FUNCTION__);
+        return -1;
+    }
+
+    // std::cout << __FUNCTION__ << ": find audio stream success. audio_stream_index: " << audio_stream_index << std::endl;;
+    printf("%s: find audio stream success. audio_stream_index: %d\n", __FUNCTION__, audio_stream_index);
+    // 获取 audio stream
+    AVStream* audio_stream = format_context->streams[audio_stream_index];
+    // 根据codec id获取codec
+    audio_decoder = (AVCodec*)avcodec_find_decoder(format_context->streams[audio_stream_index]->codecpar->codec_id);
+
+    if (audio_decoder == NULL)
+    {
+        fprintf(stderr, "%s: can not find an audio codec.\n", __FUNCTION__);
+        return -1;
+    }
+
+    printf("audio decoder: %s, codec id: %d, codec long name: %s\n", audio_decoder->name, audio_decoder->id, audio_decoder->long_name);
+    // 初始化解码器上下文
+    audio_dec_ctx = (AVCodecContext*)avcodec_alloc_context3(audio_decoder);
+    // 复制参数
+    avcodec_parameters_to_context(audio_dec_ctx, audio_stream->codecpar);
+
+    if (avcodec_open2(audio_dec_ctx, audio_decoder, NULL) < 0)
+    {
+        fprintf(stderr, "%s can not open a audio codec.\n", __FUNCTION__);
+        return -1;
+    }
+
+    printf("%s: initialize audio decoder success.\n", __FUNCTION__);
+    // av_dump_format(format_context, 0, ":0", 0);
+    // show_audio_input_ctx(audio_stream);
+
+
     const char* file_path = "/Users/xuan/CLionProjects/ffmpeg/audio.pcm";
     // const char* file_path = "/Users/xuan/CLionProjects/ffmpeg/audio.aac";
+    // 判断文件是否存在，如果存在，就删除
+    remove(file_path);
+
     FILE* out_file = fopen(file_path, "wb+");
     int count = 0;
     // 音视频数据都是封装在AVPacket中，所以可以在上下文中获得AVPacket，让程序周期性的拉取音频设备的音频数据，并读取
-    AVPacket packet;
+    AVFrame* frame = av_frame_alloc();
+    AVPacket* pkt = av_packet_alloc();
 
 
     // ************* 重采样 配置 start *************
@@ -240,75 +348,92 @@ int main(void)
     // 音频输入数据
 
     AVCodecContext* av_codec_context = create_encoder_context();
-
+    // int out_frame_nb_samples = av_rescale_rnd(512, 44100, 48000, AV_ROUND_UP);
+    AVFrame* out_frame = alloc_audio_frame(av_codec_context->sample_fmt, av_codec_context->ch_layout, 48000, av_codec_context->frame_size);;
     AVPacket* newPkt = av_packet_alloc();
-
-    AVFrame* frame = av_frame_alloc();
-    if (!frame)
-    {
-        fprintf(stderr, "Could not allocate audio frame\n");
-        exit(1);
-    }
-    // 设置单通道数据采样大小
-    frame->nb_samples = av_codec_context->frame_size;
-    // 数据采样的大小
-    frame->format = av_codec_context->sample_fmt;
-    // 设置对用的通道大小
-    ret = av_channel_layout_copy(&frame->ch_layout, &av_codec_context->ch_layout);
-    if (ret < 0)
-        exit(1);
-
-    // 设置AVFrame的buffer
-    av_frame_get_buffer(frame, 0);
     // *************使用编码器编码 end ************
 
 
     while (count++ < 1000)
     {
-        ret = av_read_frame(format_context, &packet);
+
+        ret = av_read_frame(format_context, pkt);
+
         // ret返回-35 表示设备还没准备好, 先睡眠1s
         // device not ready, sleep 1s
         if (ret == -35)
         {
             av_log(NULL, AV_LOG_WARNING, "device not ready, wait 0.5s\n");
-            av_packet_unref(&packet);
+            av_packet_unref(pkt);
             usleep(5000);
             continue;
         }
         if (ret < 0)
         {
             av_log(NULL, AV_LOG_ERROR, "read data error from device\n");
-            av_packet_unref(&packet);
+            av_packet_unref(pkt);
             break;
         }
-        //单声道输出 pkt size is 2048(0x12580f400)
-        //一帧音频包含1024个sample
-        av_log(NULL, AV_LOG_INFO,
-               "pkt size is %d(%p),count=%d \n",
-               packet.size, packet.data, count);
 
-        //把packet中数据 拷贝到in_buffer中
-        memcpy(in_buffer, packet.data, packet.size);
+        if (ret == 0)
+        {
+            if (pkt->stream_index == audio_stream_index)
+            {
+                ret = avcodec_send_packet(audio_dec_ctx, pkt);
 
-        //重采样音频数据
-        swr_convert(swr_context, &out_buffer, 512, &in_buffer, 512);
+                while (ret >= 0)
+                {
+                    ret = avcodec_receive_frame(audio_dec_ctx, frame);
 
-        // *************使用编码器编码 start ************
+                    if (ret == AVERROR_EOF || ret == AVERROR(EAGAIN))
+                    {
+                        break;
+                    }
+                    else if (ret < 0)
+                    {
+                        fprintf(stderr, "avcodec_receive_frame failed\n");
+                        return -1;
+                    }
 
-        // memcpy(frame->data[0], out_buffer, out_buffer_size);
 
-        // encode(av_codec_context, frame, newPkt, out_file);
+                    //单声道输出 pkt size is 2048(0x12580f400)
+                    //一帧音频包含1024个sample
+                    av_log(NULL, AV_LOG_INFO,
+                           "pkt size is %d(%p),count=%d \n",
+                           pkt->size, pkt->data, count);
 
-        fwrite(out_buffer, out_buffer_size, 1, out_file);
-        fflush(out_file);
-        // *************使用编码器编码 end ************
+                    //把packet中数据 拷贝到in_buffer中
+                    memcpy(in_buffer, pkt->data, pkt->size);
+                    //重采样音频数据
+                    // 这里的 512 是指一个该通道的样本数量
+                    swr_convert(swr_context, &out_buffer, 512, &in_buffer, 512);
+                    ret = swr_convert_frame(swr_context, out_frame, frame);
 
-        av_packet_unref(&packet);
+                    // *************使用编码器编码 start ************
+
+                    // av_frame_make_writable(out_frame);
+                    // memcpy((void *)out_frame->data[0], out_buffer, out_buffer_size);
+
+                    // encode(av_codec_context, out_frame, newPkt, out_file);
+
+                    fwrite(out_buffer, out_buffer_size, 1, out_file);
+                    fflush(out_file);
+                    // *************使用编码器编码 end ************
+
+                    av_packet_unref(pkt);
+
+                }
+            }
+        }
+
+
+
+
     }
 
 
-    // encode(av_codec_context, NULL, newPkt, out_file);
-    av_frame_free(&frame);
+    encode(av_codec_context, NULL, newPkt, out_file);
+    av_frame_free(&out_frame);
     av_packet_free(&newPkt);
 
 
