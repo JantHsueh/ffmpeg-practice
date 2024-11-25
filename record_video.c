@@ -10,10 +10,8 @@
 #include "libavdevice/avdevice.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/dict.h"
-#include "libavutil/mathematics.h"
-#include "libavutil/time.h"
- 
-int main()
+
+void record_video()
 {
 	AVFormatContext *ifmtCtx = NULL;
 	AVFormatContext *ofmtCtx = NULL;
@@ -217,7 +215,10 @@ int main()
 			av_codec_ctx_in->pix_fmt, av_codec_ctx_in->width, av_codec_ctx_in->height,
 			AV_PIX_FMT_YUV420P, SWS_BICUBIC, NULL, NULL, NULL);
 
-
+    // 1、av_read_frame收到原始数据
+    // 2、用输入流对应的解码器解码，
+    // 3、经过转换器转换成YUV420P格式
+    // 4、用h264对应的编码器编码
 	while (frameIndex < 200)
 	{
 		// 3.2 从输入流读取一个packet
