@@ -21,9 +21,9 @@ add_executable(ffmpeg main.c
         acc.c
         acc1.c
         pushstream.c
-        record_video2.c
         record_video.c
-        video.h)
+        video_audio.h
+        av_common.c)
 
 target_link_libraries(
         ffmpeg

@@ -11,3 +11,6 @@
 //声明record_video2函数
 void record_video2();
 void record_video();
+void push_stream();
+
+int record_audio();
