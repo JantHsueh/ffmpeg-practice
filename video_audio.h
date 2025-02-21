@@ -14,3 +14,4 @@ void record_video();
 void push_stream();
 
 int record_audio();
+int record_audio2();

@@ -29,23 +29,16 @@ static void encode_and_write_frame(AVCodecContext* h264_encoder_ctx, AVFrame* co
         printf("avcodec_receive_packet failed to encode.\n");
         return;
     }
-    // 设置输出DTS,PTS，如果启用b帧，pts 和 dts 不能设置相同值，会出现视频画面前面跳动
+    // 不应该手动设置packet的dts，应该由编码器自动设置
+    // 设置输出DTS,PTS，如果启用b帧，pts 和 dts 不能设置相同值，会出现视频画面前面跳动，
     // pkt->pts = pkt->dts = frameIndex * (ofmtCtx->streams[0]->time_base.den) / ofmtCtx->streams[0]->time_base.num / 25;
 
-
     // 使用编码器提供的 PTS/DTS 并转换到输出流的时间基
-    // pkt->pts = av_rescale_q_rnd(pkt->pts, h264_encoder_ctx->time_base, ofmtCtx->streams[0]->time_base, AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
-    // pkt->dts = av_rescale_q_rnd(pkt->dts, h264_encoder_ctx->time_base, ofmtCtx->streams[0]->time_base, AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
-    // pkt->duration = av_rescale_q(1, h264_encoder_ctx->time_base, ofmtCtx->streams[0]->time_base);
     av_packet_rescale_ts(pkt, h264_encoder_ctx->time_base, ofmtCtx->streams[0]->time_base);
-
     pkt->stream_index = 0; // 确保设置 stream_index
-
 
     // 打印pkt 中的pts，dts，duration
     printf("pkt pts: %ld, dts: %ld, duration: %ld\n", pkt->pts, pkt->dts, pkt->duration);
-
-
     ret = av_interleaved_write_frame(ofmtCtx, pkt);
     if (ret < 0)
     {
@@ -92,10 +85,10 @@ static void process_frame_use_decode(AVPacket* pkt, AVFrame* decoded_frame, AVFr
 
     if (avcodec_receive_frame(av_decoder_ctx, decoded_frame) >= 0)
     {
+        // frame的格式，转换成YUV420P
         sws_scale(sws_ctx,
                   decoded_frame->data, decoded_frame->linesize, 0, av_decoder_ctx->height,
                   converted_frame->data, converted_frame->linesize);
-
 
 
         // Store the first PTS value
@@ -109,17 +102,17 @@ static void process_frame_use_decode(AVPacket* pkt, AVFrame* decoded_frame, AVFr
         printf("av_decoder_ctx time_base: %d/%d\n", av_decoder_ctx->time_base.num, av_decoder_ctx->time_base.den);
         printf("h264_encoder_ctx time_base: %d/%d\n", h264_encoder_ctx->time_base.num, h264_encoder_ctx->time_base.den);
 
-        // 将 decoded_frame 的 PTS 传递给 converted_frame, 并进行时间基转换
+        // 得到相对于起始时间first_pts的PTS，pts从0开始，保证了视频时长的正确性
         converted_frame->pts = decoded_frame->pts - first_pts;
 
-        // 将 decoded_frame 的 PTS 和 DTS 进行时间基转换，传递给 converted_frame
+        // 将 decoded_frame 的 PTS 进行时间基转换，传递给 converted_frame
         converted_frame->pts = av_rescale_q(converted_frame->pts, av_decoder_ctx->time_base, h264_encoder_ctx->time_base);
 
-        // 因为此时是未编码的帧，所以dts和pts相同，经过h264编码后，dts会变化
-        converted_frame->pkt_dts = converted_frame->pts;
-        // 打印pts，dts
-        printf("decoded_frame pts: %ld, dts: %ld\n", decoded_frame->pts, decoded_frame->pkt_dts);
-        printf("converted_frame pts: %ld, dts: %ld\n", converted_frame->pts, converted_frame->pkt_dts);
+        // 打印pts，pkt_dts，
+        // frame 的pkt_dts 是取自packet的dts，此处打印pkt_dts，意义不大，只是想看看
+        // 经过h264编码后，会自动设置packet的dts
+        printf("decoded_frame pts: %ld, pkt_dts: %ld\n", decoded_frame->pts, decoded_frame->pkt_dts);
+        printf("converted_frame pts: %ld, pkt_dts: %ld\n", converted_frame->pts, converted_frame->pkt_dts);
 
         encode_and_write_frame(h264_encoder_ctx, converted_frame, ofmtCtx, pkt, frameIndex);
     }
@@ -155,16 +148,16 @@ void record_video()
     }
 
     // 2、 打开输入流对应的解码器
-    av_decoder_ctx = open_decoder_by_format_context(ifmtCtx, &videoIndex);
+    av_decoder_ctx = open_decoder_by_format_context(ifmtCtx, &videoIndex, AVMEDIA_TYPE_VIDEO);
 
     // 3、 打开H264编码器
-    h264_encoder_ctx = open_h264_encoder(av_decoder_ctx->width, av_decoder_ctx->height);
+    h264_encoder_ctx = open_encoder_h264(av_decoder_ctx->width, av_decoder_ctx->height);
 
     // 4、创建输出上下文并初始化 流、写入头文件
     ofmtCtx = init_output_format_context("/Users/xuan/CLionProjects/ffmpeg/2.mp4", h264_encoder_ctx);
 
     decoded_frame = av_frame_alloc();
-    converted_frame = create_writable_frame(h264_encoder_ctx->width, h264_encoder_ctx->height, AV_PIX_FMT_YUV420P);
+    converted_frame = create_writable_video_frame(h264_encoder_ctx->width, h264_encoder_ctx->height, AV_PIX_FMT_YUV420P);
 
 
     sws_ctx = sws_getContext(av_decoder_ctx->width, av_decoder_ctx->height, av_decoder_ctx->pix_fmt,
@@ -173,8 +166,9 @@ void record_video()
 
     // 1、av_read_frame收到原始数据
     // 2、用输入流对应的解码器解码，
-    // 3、经过转换器转换成YUV420P格式
-    // 4、用h264对应的编码器编码
+    // 3、经过转换器转换成YUV420P格式，对pts进行时间基转换
+    // 4、用h264对应的编码器编码, 对packet进行时间基转换
+    // 5、写入文件
     while (frameIndex < 200)
     {
         // 3.2 从输入流读取一个packet
@@ -207,10 +201,10 @@ void record_video()
             // process frame 多选一
 
             //av_read_frame 接收到的是原始数据，不需要解码，可以这样直接发送给编码器
-            process_frame(&pkt, converted_frame, h264_encoder_ctx, ofmtCtx,frameIndex);
+            // process_frame(&pkt, converted_frame, h264_encoder_ctx, ofmtCtx, frameIndex);
 
             //av_read_frame 接收到的是原始数据，也可以解码后再发送给编码器。如果接收到是编码后的数据packet，需要解码后再发送给编码器
-            // process_frame_use_decode(&pkt, decoded_frame, converted_frame, av_decoder_ctx, h264_encoder_ctx, ofmtCtx, sws_ctx, frameIndex);
+            process_frame_use_decode(&pkt, decoded_frame, converted_frame, av_decoder_ctx, h264_encoder_ctx, ofmtCtx, sws_ctx, frameIndex);
             frameIndex++;
         }
         av_frame_unref(decoded_frame);

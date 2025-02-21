@@ -8,74 +8,10 @@
 #include  "libswresample/swresample.h"
 #include <unistd.h>
 #include <sys/time.h>
-#include "video.h"
 
-AVFormatContext* open_device()
-{
-    char error[1024] = {0};
-    //1、注册音频设备
-    avdevice_register_all();
+#include "av_common.h"
+#include "video_audio.h"
 
-    //2、设置采集方式 avfoundtion / dshow->windows / alsa ->linux
-    const AVInputFormat* input_format = av_find_input_format("avfoundation");
-
-    //通过avformat_open_input获得一个输入上下文，后续所有对于音频的操作都是在这个上下文中进行的
-    AVFormatContext* format_context = NULL;
-    // 可以是一个url，或者设备对应格式
-    // mac 设备名称格式，[[video device]:[audio device]]
-    // video device 0 表示摄像头，1 表示桌面
-    char* input_device = "0";
-    AVDictionary* options = NULL;
-    // 设置双通道，todo 不起作用
-    // av_dict_set(&options, "channels", "2", 0);
-    // 设置比特率为64000
-    // av_dict_set(&options, "b", "64000", 0);
-    av_dict_set(&options, "video_size", "640x480", 0);
-    av_dict_set(&options, "framerate", "30", 0);
-    //设置视频格式为NV12
-    av_dict_set(&options, "pixel_format", "nv12", 0);
-    //3、打开音频设备
-    int ret = avformat_open_input(&format_context, input_device, input_format, &options);
-    // 打印音频流信息
-    av_dump_format(format_context, 0, input_device, 0);
-    if (ret < 0)
-    {
-        av_strerror(ret, error, 1024);
-        //打印error
-        printf("error: %s\n", error);
-        return NULL;
-    }
-
-    return format_context;
-}
-
-
-SwrContext* create_swr_context()
-{
-    char error[1024] = {0};
-
-    //1、创建重采样上下文
-    SwrContext* swr_context = swr_alloc();
-
-    //2、设置重采样参数
-    AVChannelLayout in_ch_layout = AV_CHANNEL_LAYOUT_MONO;
-    AVChannelLayout out_ch_layout = AV_CHANNEL_LAYOUT_STEREO;
-    //设置源音频参数
-    int ret = swr_alloc_set_opts2(&swr_context,
-                                  &out_ch_layout, AV_SAMPLE_FMT_S16, 48000,
-                                  &in_ch_layout, AV_SAMPLE_FMT_FLT, 48000,
-                                  0, NULL);
-
-    if (ret < 0)
-    {
-        av_strerror(ret, error, 1024);
-        printf("error: %s\n", error);
-        return NULL;
-    }
-    //5、初始化重采样上下文
-    swr_init(swr_context);
-    return swr_context;
-}
 
 
 /* check that a given sample format is supported by the encoder */
@@ -113,7 +49,7 @@ int select_sample_rate(const AVCodec* codec)
 }
 
 /* select layout with the highest channel count */
-int select_channel_layout(const AVCodec* codec, AVChannelLayout* dst)
+static int select_channel_layout(const AVCodec* codec, AVChannelLayout* dst)
 {
     const AVChannelLayout *p, *best_ch_layout;
     int best_nb_channels = 0;
@@ -140,36 +76,7 @@ int select_channel_layout(const AVCodec* codec, AVChannelLayout* dst)
     return av_channel_layout_copy(dst, best_ch_layout);
 }
 
-void encode(AVCodecContext* ctx, AVFrame* frame, AVPacket* pkt,
-            FILE* output)
-{
-    int ret;
 
-    /* send the frame for encoding */
-    ret = avcodec_send_frame(ctx, frame);
-    if (ret < 0)
-    {
-        fprintf(stderr, "Error sending the frame to the encoder\n");
-        exit(1);
-    }
-
-    /* read all the available output packets (in general there may be any
-     * number of them */
-    while (ret >= 0)
-    {
-        ret = avcodec_receive_packet(ctx, pkt);
-        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
-            return;
-        else if (ret < 0)
-        {
-            fprintf(stderr, "Error encoding audio frame\n");
-            exit(1);
-        }
-
-        fwrite(pkt->data, 1, pkt->size, output);
-        av_packet_unref(pkt);
-    }
-}
 
 
 AVCodecContext* create_encoder_context()
@@ -212,291 +119,6 @@ AVCodecContext* create_encoder_context()
 }
 
 
-AVFrame* alloc_audio_frame(enum AVSampleFormat sample_fmt,
-                           AVChannelLayout ch_layout, int sample_rate,
-                           int nb_samples)
-{
-    AVFrame* frame = av_frame_alloc();
-    int ret;
-
-    if (!frame)
-    {
-        fprintf(stderr, "Error allocating an audio frame\n");
-        exit(1);
-    }
-    // 多次测试发现，带编码的帧，需要设置好这些参数，之前没有设置sample_rate，导致保存的音频总是有问题，滋滋响
-    frame->format = sample_fmt;
-    frame->ch_layout = ch_layout;
-    frame->sample_rate = sample_rate;
-    frame->nb_samples = nb_samples;
-
-    if (nb_samples)
-    {
-        ret = av_frame_get_buffer(frame, 0);
-
-        if (ret < 0)
-        {
-            fprintf(stderr, "Error allocating an audio buffer\n");
-            exit(1);
-        }
-    }
-
-    return frame;
-}
-
-int recoder_audio()
-{
-    av_log_set_level(AV_LOG_DEBUG);
-    //ffmpeg 打印日志
-    av_log(NULL, AV_LOG_DEBUG, "Hello, World ffmpeg!\n");
-
-    int ret = 0;
-    //调用open_device
-    AVFormatContext* format_context = open_device();
-    AVCodecContext* video_codec_context = NULL;
-
-
-    int audio_stream_index = -1; // microphone input audio stream index
-    AVCodec* audio_decoder = NULL;
-    AVCodecContext* audio_dec_ctx = NULL;
-    // 寻找音频流
-    for (int i = 0; i < format_context->nb_streams; i++)
-    {
-        if (format_context->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
-        {
-            audio_stream_index = i;
-            break;
-        }
-    }
-
-    if (audio_stream_index == -1)
-    {
-        fprintf(stderr, "%s could not find an audio stream.\n", __FUNCTION__);
-        return -1;
-    }
-
-    // std::cout << __FUNCTION__ << ": find audio stream success. audio_stream_index: " << audio_stream_index << std::endl;;
-    printf("%s: find audio stream success. audio_stream_index: %d\n", __FUNCTION__, audio_stream_index);
-    // 获取 audio stream
-    AVStream* audio_stream = format_context->streams[audio_stream_index];
-    // 根据codec id获取codec
-    audio_decoder = (AVCodec*)avcodec_find_decoder(format_context->streams[audio_stream_index]->codecpar->codec_id);
-
-    if (audio_decoder == NULL)
-    {
-        fprintf(stderr, "%s: can not find an audio codec.\n", __FUNCTION__);
-        return -1;
-    }
-
-    printf("audio decoder: %s, codec id: %d, codec long name: %s\n", audio_decoder->name, audio_decoder->id, audio_decoder->long_name);
-    // 初始化解码器上下文
-    audio_dec_ctx = (AVCodecContext*)avcodec_alloc_context3(audio_decoder);
-    // 复制参数
-    avcodec_parameters_to_context(audio_dec_ctx, audio_stream->codecpar);
-
-    if (avcodec_open2(audio_dec_ctx, audio_decoder, NULL) < 0)
-    {
-        fprintf(stderr, "%s can not open a audio codec.\n", __FUNCTION__);
-        return -1;
-    }
-
-    printf("%s: initialize audio decoder success.\n", __FUNCTION__);
-    // av_dump_format(format_context, 0, ":0", 0);
-    // show_audio_input_ctx(audio_stream);
-
-
-    const char* file_path = "/Users/xuan/CLionProjects/ffmpeg/audio.pcm";
-    // const char* file_path = "/Users/xuan/CLionProjects/ffmpeg/audio.aac";
-    // 判断文件是否存在，如果存在，就删除
-    remove(file_path);
-
-    FILE* out_file = fopen(file_path, "wb+");
-    int count = 0;
-    // 音视频数据都是封装在AVPacket中，所以可以在上下文中获得AVPacket，让程序周期性的拉取音频设备的音频数据，并读取
-    AVFrame* frame = av_frame_alloc();
-    AVPacket* pkt = av_packet_alloc();
-
-
-    // ************* 重采样 配置 start *************
-    // 创建并初始化 重采样上下文
-    SwrContext* swr_context = create_swr_context();
-
-    //1、创建输入音频数据缓冲区
-    uint8_t* in_buffer;
-    //输入的音频数据大小
-    int in_buffer_size = 0;
-    //2、分配输入音频数据缓冲区
-    //AV_SAMPLE_FMT_FLT 分配的in_buffer_size大小为4096
-    //AV_SAMPLE_FMT_FLTP 分配的in_buffer_size大小为2048
-    //带P（plane）的数据格式在存储时，其左声道和右声道的数据是分开存储的，左声道的数据存储在data0，右声道的数据存储在data1，av_samples_alloc 返回的linesize 就是单个声道的数据大小
-    //不带P（packed）的⾳频数据在存储时，是按照LRLRLR...的格式交替存储在data0中，av_samples_alloc 返回的linesize 就是所有声道的数据大小
-    av_samples_alloc(&in_buffer, &in_buffer_size, 1, 512, AV_SAMPLE_FMT_FLT, 0);
-    //3、创建输出音频数据缓冲区
-    uint8_t* out_buffer;
-    //输出的音频数据大小
-    int out_buffer_size = 0;
-    //4、分配输出音频数据缓冲区
-    av_samples_alloc(&out_buffer, &out_buffer_size, 2, 512, AV_SAMPLE_FMT_S16, 0);
-    //*****重采样 配置 end********
-
-
-    // *************使用编码器编码 start ************
-    // 音频输入数据
-
-    AVCodecContext* av_codec_context = create_encoder_context();
-    // int out_frame_nb_samples = av_rescale_rnd(512, 44100, 48000, AV_ROUND_UP);
-    AVFrame* out_frame = alloc_audio_frame(av_codec_context->sample_fmt, av_codec_context->ch_layout, 48000, av_codec_context->frame_size);;
-    AVPacket* newPkt = av_packet_alloc();
-    // *************使用编码器编码 end ************
-
-
-    while (count++ < 1000)
-    {
-        ret = av_read_frame(format_context, pkt);
-
-        // ret返回-35 表示设备还没准备好, 先睡眠1s
-        // device not ready, sleep 1s
-        if (ret == -35)
-        {
-            av_log(NULL, AV_LOG_WARNING, "device not ready, wait 0.5s\n");
-            av_packet_unref(pkt);
-            usleep(5000);
-            continue;
-        }
-        if (ret < 0)
-        {
-            av_log(NULL, AV_LOG_ERROR, "read data error from device\n");
-            av_packet_unref(pkt);
-            break;
-        }
-
-        if (ret == 0)
-        {
-            if (pkt->stream_index == audio_stream_index)
-            {
-                ret = avcodec_send_packet(audio_dec_ctx, pkt);
-
-                while (ret >= 0)
-                {
-                    ret = avcodec_receive_frame(audio_dec_ctx, frame);
-
-                    if (ret == AVERROR_EOF || ret == AVERROR(EAGAIN))
-                    {
-                        break;
-                    }
-                    else if (ret < 0)
-                    {
-                        fprintf(stderr, "avcodec_receive_frame failed\n");
-                        return -1;
-                    }
-
-
-                    //单声道输出 pkt size is 2048(0x12580f400)
-                    //一帧音频包含1024个sample
-                    av_log(NULL, AV_LOG_INFO,
-                           "pkt size is %d(%p),count=%d \n",
-                           pkt->size, pkt->data, count);
-
-                    //把packet中数据 拷贝到in_buffer中
-                    memcpy(in_buffer, pkt->data, pkt->size);
-                    //重采样音频数据
-                    // 这里的 512 是指一个该通道的样本数量
-                    swr_convert(swr_context, &out_buffer, 512, &in_buffer, 512);
-                    ret = swr_convert_frame(swr_context, out_frame, frame);
-
-                    // *************使用编码器编码 start ************
-
-                    // av_frame_make_writable(out_frame);
-                    // memcpy((void *)out_frame->data[0], out_buffer, out_buffer_size);
-
-                    // encode(av_codec_context, out_frame, newPkt, out_file);
-
-                    fwrite(out_buffer, out_buffer_size, 1, out_file);
-                    fflush(out_file);
-                    // *************使用编码器编码 end ************
-
-                    av_packet_unref(pkt);
-                }
-            }
-        }
-    }
-
-
-    encode(av_codec_context, NULL, newPkt, out_file);
-    av_frame_free(&out_frame);
-    av_packet_free(&newPkt);
-
-
-    fclose(out_file);
-    //7、释放重采样上下文，释放输入输出音频数据缓冲区
-    av_free(in_buffer);
-    av_free(out_buffer);
-    swr_free(&swr_context);
-    //4、关闭音频设备
-    avformat_close_input(&format_context);
-    av_log(NULL, AV_LOG_INFO, "finish read audio device.");
-}
-
-
-/**
- *
- * 打开视频编码器
- */
-void open_video_encoder(int width, int height, AVCodecContext** codec_context)
-{
-    //1、查找编码器
-    const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_H264);
-    if (!codec)
-    {
-        fprintf(stderr, "Codec not found\n");
-        exit(1);
-    }
-
-    //2、创建编码器上下文
-    *codec_context = avcodec_alloc_context3(codec);
-    if (!(*codec_context))
-    {
-        fprintf(stderr, "Could not allocate video codec context\n");
-        exit(1);
-    }
-
-    //3、设置编码器参数
-
-    //sps
-    //
-    // (*codec_context)->profile = FF_PROFILE_H264_HIGH_444;
-    // (*codec_context)->level = 50;
-
-    (*codec_context)->width = width;
-    (*codec_context)->height = height;
-
-    (*codec_context)->gop_size = 250; // 两个I帧之间的帧数量
-    (*codec_context)->keyint_min = 25; // option 两个I帧之间的最小帧数, 如果两个帧之间差别大，可以插入一个关键帧
-
-    // 设置B帧，减少码流
-    (*codec_context)->max_b_frames = 3; // option  最大B帧数
-    (*codec_context)->has_b_frames = 1; // option  1 表示有B帧，0表示没有B帧，更低的延时
-    (*codec_context)->refs = 5; // option
-
-    (*codec_context)->pix_fmt = AV_PIX_FMT_YUV420P;
-
-    (*codec_context)->bit_rate = 92160000;
-
-    // 设置帧率
-    (*codec_context)->time_base = (AVRational){30, 1};
-    // (*codec_context)->framerate = (AVRational){30, 1};
-
-    //4、打开编码器
-    if (avcodec_open2(*codec_context, codec, NULL) < 0)
-    {
-        fprintf(stderr, "Could not open codec\n");
-        exit(1);
-    }
-}
-
-
-
-
 /**
  *
  * 重采样后的播放命令
@@ -509,9 +131,13 @@ void open_video_encoder(int width, int height, AVCodecContext** codec_context)
  * https://www.reddit.com/r/ffmpeg/comments/1edfvsx/whats_the_replacement_for_the_ac_option/
  * @return
  */
-int main2(void)
+int main(void)
 {
     record_video();
-    record_video2();
+    // push_stream();
+    // resample_audio();
+    // record_audio();
+    // 播放命令ffplay -ar 44100 -ch_layout stereo -f s16le 1.pcm
+    // record_audio2();
     return 0;
 }

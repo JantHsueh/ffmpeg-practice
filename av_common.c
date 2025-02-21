@@ -17,7 +17,7 @@ AVFormatContext* open_device()
     // 可以是一个url，或者设备对应格式
     // mac 设备名称格式，[[video device]:[audio device]]
     // video device 0 表示摄像头，1 表示桌面
-    char* input_device = "0";
+    char* input_device = "0:0";
     AVDictionary* options = NULL;
     // 设置双通道，todo 不起作用
     // av_dict_set(&options, "channels", "2", 0);
@@ -46,46 +46,59 @@ AVFormatContext* open_device()
 }
 
 
-AVCodecContext* open_decoder_by_format_context(AVFormatContext *ifmtCtx, int *videoIndex)
+AVCodecContext* open_decoder_by_format_context(AVFormatContext* ifmtCtx, int* videoIndex, enum AVMediaType type )
 {
     AVCodecContext* decoder_ctx;
     AVCodec* decoder;
 
-    unsigned int i = 0;
 
-    // 1.3 获取输入ctx
-    for (i = 0; i < ifmtCtx->nb_streams; ++i)
-    {
-        if (ifmtCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
-        {
-            *videoIndex = i;
-            break;
-        }
-    }
+    // // ---- 通过指定音频流，创建出解码器 ----begin
 
-    printf("%s:%d, videoIndex = %d\n", __FUNCTION__, __LINE__, *videoIndex);
+    // unsigned int i = 0;
+    //
+    // // 查找是第一个类型符合的流
+    // for (i = 0; i < ifmtCtx->nb_streams; ++i)
+    // {
+    //     if (ifmtCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+    //     {
+    //         *videoIndex = i;
+    //         break;
+    //     }
+    // }
+    //
+    // printf("%s:%d, videoIndex = %d\n", __FUNCTION__, __LINE__, *videoIndex);
+    //
+    // // 查找输入解码器
+    // decoder = avcodec_find_decoder(ifmtCtx->streams[*videoIndex]->codecpar->codec_id);
 
-    // 1.4 查找输入解码器
-    decoder = avcodec_find_decoder(ifmtCtx->streams[*videoIndex]->codecpar->codec_id);
+    // // ---- 通过指定音频流，创建出解码器 ---- end， 可通过av_find_best_stream函数代替
+
+    *videoIndex = av_find_best_stream(ifmtCtx, type, -1, -1, &decoder, 0);
+
+
     if (!decoder)
     {
-        printf("can't find codec\n");
+        printf("can't find decoder\n");
         return NULL;
     }
 
     decoder_ctx = avcodec_alloc_context3(decoder);
     if (!decoder_ctx)
     {
-        printf("can't alloc codec context\n");
+        fprintf(stderr, "Could not allocate audio codec context\n");
         return NULL;
     }
 
-    avcodec_parameters_to_context(decoder_ctx, ifmtCtx->streams[*videoIndex]->codecpar);
+    if (avcodec_parameters_to_context(decoder_ctx, ifmtCtx->streams[*videoIndex]->codecpar))
+    {
+        fprintf(stderr, "Could not copy codec parameters to codec context\n");
+        return NULL;
+    }
 
     //  1.5 打开输入解码器
     if (avcodec_open2(decoder_ctx, decoder, NULL) < 0)
     {
-        printf("can't open codec\n");
+        fprintf(stderr, "Could not open codec\n");
         return NULL;
     }
     AVStream* video_stream = ifmtCtx->streams[*videoIndex];
@@ -107,7 +120,7 @@ AVCodecContext* open_decoder_by_format_context(AVFormatContext *ifmtCtx, int *vi
 }
 
 
-AVCodecContext* open_h264_encoder(int width, int height)
+AVCodecContext* open_encoder_h264(int width, int height)
 {
     AVCodecContext* encoder_codec_ctx;
 
@@ -164,28 +177,99 @@ AVCodecContext* open_h264_encoder(int width, int height)
 }
 
 
-AVFormatContext* init_output_format_context(const char* out_filename, AVCodecContext* h264_encoder_ctx)
+AVCodecContext* open_encoder_audio()
+{
+
+    AVCodec* encoder = NULL;
+    AVCodecContext* encoder_ctx = NULL;
+
+    // 查找编码器
+    encoder = avcodec_find_encoder(AV_CODEC_ID_AAC);
+    // encoder = avcodec_find_encoder(AV_CODEC_ID_MP2);
+    // encoder = avcodec_find_encoder_by_name("libfdk_aac");
+    if (!encoder)
+    {
+        fprintf(stderr, "Codec not found\n");
+        return NULL;
+    }
+
+    // 创建编码器上下文
+    encoder_ctx = avcodec_alloc_context3(encoder);
+    if (!encoder_ctx)
+    {
+        fprintf(stderr, "Could not allocate audio codec context\n");
+        return NULL;
+    }
+
+    // 设置编码器参数
+    encoder_ctx->bit_rate = 192000; // 比特率为192kbps
+    encoder_ctx->sample_fmt = AV_SAMPLE_FMT_FLTP; // 采样格式，aac
+    // encoder_ctx->sample_fmt = AV_SAMPLE_FMT_S16; // 采样格式
+    encoder_ctx->sample_rate = 48000; // 采样率
+    // encoder_ctx->channel_layout = AV_CH_LAYOUT_STEREO; // 双声道布局
+    encoder_ctx->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
+    // aac 编码器的 每帧的采样数量固定是1024，即使手动设置也无效
+    // MP2 编码器的 每帧的采样数量固定是1152，即使手动设置也无效
+    encoder_ctx->frame_size = 512; // 编码器帧数量
+    // encoder_ctx->channels = 2;
+
+    // 打开编码器
+    if (avcodec_open2(encoder_ctx, encoder, NULL) < 0)
+    {
+        fprintf(stderr, "Could not open codec\n");
+        avcodec_free_context(&encoder_ctx);
+        return NULL;
+    }
+    printf("AAC Encoder frame_size: %d\n", encoder_ctx->frame_size);
+
+    return encoder_ctx;
+}
+
+
+
+
+
+AVFormatContext* init_output_format_context(const char* out_filename, AVCodecContext* encoder_ctx)
 {
     AVFormatContext* ofmt_ctx = NULL;
-    const char* inFilename = "0"; //输入URL
-    const char* ofmtName = NULL;
     int ret = 0;
 
+    // // begin
+    // if (strstr(out_filename, "rtmp://"))
+    // {
+    //     ofmtName = "flv";
+    // }
+    // else if (strstr(out_filename, "udp://"))
+    // {
+    //     ofmtName = "mpegts";
+    // }
+    // else
+    // {
+    //     ofmtName = NULL;
+    // }
     //
-    if (strstr(out_filename, "rtmp://"))
+    // avformat_alloc_output_context2(&ofmt_ctx, NULL, ofmtName, out_filename);
+    //  // end 使用av_guess_format 代码
+
+    const AVOutputFormat* out_fmt = NULL;
+    //
+    // 设置输出文件的格式与路径
+    out_fmt = av_guess_format(NULL, out_filename, NULL);
+    if (!out_fmt)
     {
-        ofmtName = "flv";
-    }
-    else if (strstr(out_filename, "udp://"))
-    {
-        ofmtName = "mpegts";
-    }
-    else
-    {
-        ofmtName = NULL;
+        fprintf(stderr, "could not guess file format\n");
+        return NULL;
     }
 
-    avformat_alloc_output_context2(&ofmt_ctx, NULL, ofmtName, out_filename);
+    // 打开输出格式的上下文
+    if (avformat_alloc_output_context2(&ofmt_ctx, out_fmt, NULL, out_filename) < 0)
+    {
+        fprintf(stderr, "could not create output context\n");
+        return NULL;
+    }
+
+
+
     if (!ofmt_ctx)
     {
         printf("can't create output context\n");
@@ -200,8 +284,17 @@ AVFormatContext* init_output_format_context(const char* out_filename, AVCodecCon
         return NULL;
     }
 
-    avcodec_parameters_from_context(out_stream->codecpar, h264_encoder_ctx);
-    out_stream->time_base = h264_encoder_ctx->time_base;
+
+    // 给输出流设置编码器
+    if (avcodec_parameters_from_context(out_stream->codecpar, encoder_ctx) < 0)
+    {
+        fprintf(stderr, "Failed to copy encoder parameters to output stream\n");
+        avcodec_free_context(&encoder_ctx);
+        return NULL;
+    }
+
+
+    out_stream->time_base = encoder_ctx->time_base;
 
 
     av_dump_format(ofmt_ctx, 0, out_filename, 1);
@@ -229,8 +322,10 @@ AVFormatContext* init_output_format_context(const char* out_filename, AVCodecCon
 }
 
 
-AVFrame* create_writable_frame(int width, int height, enum AVPixelFormat format)
+
+AVFrame* create_writable_video_frame(int width, int height, enum AVPixelFormat format)
 {
+
     AVFrame* frame = av_frame_alloc();
     if (!frame)
     {
@@ -242,6 +337,40 @@ AVFrame* create_writable_frame(int width, int height, enum AVPixelFormat format)
     frame->width = width;
     frame->height = height;
 
+
+    create_writable_frame(frame);
+
+    return frame;
+}
+
+
+AVFrame* create_writable_audio_frame(AVChannelLayout ch_layout, int nb_samples, enum AVPixelFormat format)
+{
+
+
+    AVFrame* frame = av_frame_alloc();
+    if (!frame)
+    {
+        fprintf(stderr, "Could not allocate video frame\n");
+        exit(1);
+    }
+    // 多次测试发现，需要被编码的帧，需要设置好这些参数，之前没有设置sample_rate，导致保存的音频总是有问题，滋滋响
+    frame->ch_layout = ch_layout;
+
+    frame->format = format;
+    frame->sample_rate = 48000;
+    // frame->nb_samples = encodec_ctx->frame_size; //与编码器帧大小保持一致
+    frame->nb_samples = nb_samples; //与编码器帧大小保持一致
+
+    create_writable_frame(frame);
+
+    return frame;
+}
+
+
+
+void create_writable_frame(AVFrame* frame)
+{
 
     //// 分配内存
     // outBuffer = (unsigned char*)av_malloc(av_image_get_buffer_size(AV_PIX_FMT_YUV420P, av_decoder_ctx->width, av_decoder_ctx->height, 1));
@@ -257,19 +386,15 @@ AVFrame* create_writable_frame(int width, int height, enum AVPixelFormat format)
     }
 
 
-
     ret = av_frame_make_writable(frame);
-    if (ret < 0) {
+    if (ret < 0)
+    {
         fprintf(stderr, "Could not make the destination frame writable\n");
         av_frame_free(&frame);
         exit(1);
     }
 
-    return frame;
 }
-
-
-
 
 
 FILE* open_file(const char* filename)

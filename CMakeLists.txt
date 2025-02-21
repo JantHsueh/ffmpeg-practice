@@ -19,7 +19,6 @@ link_directories(/opt/homebrew/Cellar/openssl@3/3.4.0/lib/) # 动态链接库或
 
 add_executable(ffmpeg main.c
         acc.c
-        acc1.c
         pushstream.c
         record_video.c
         video_audio.h
