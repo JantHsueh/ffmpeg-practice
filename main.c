@@ -133,7 +133,8 @@ AVCodecContext* create_encoder_context()
  */
 int main(void)
 {
-    record_video();
+    // record_video();
+    analyze_video();
     // push_stream();
     // resample_audio();
     // record_audio();
